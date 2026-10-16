@@ -6,6 +6,7 @@ from .convert import Report, convert_file
 from .epub import EpubOptions, build_epub
 from .umd import (
     Chapter,
+    Illustration,
     UmdBook,
     UmdError,
     UmdFormatError,
@@ -13,11 +14,12 @@ from .umd import (
     parse_umd,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "Chapter",
     "EpubOptions",
+    "Illustration",
     "Report",
     "UmdBook",
     "UmdError",

@@ -2,5 +2,7 @@ __pycache__/
 *.py[cod]
 *.umd
 *.epub
+*.jar
 samples/
+.umd2epub-illustrations/
 .venv/

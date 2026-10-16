@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
+from . import wenku8
 from .epub import EpubOptions, build_epub
 from .umd import UmdError, UmdFormatError, UnsupportedUmdError, parse_umd
 
@@ -40,6 +41,7 @@ class Report:
     degraded: bool = False
     dry_run: bool = False
     written: bool = False
+    illustrations: int = 0
     has_cover: bool = False
     cover_ext: Optional[str] = None
     cover_size: int = 0
@@ -50,6 +52,18 @@ class Report:
 
 def default_output_path(src: str) -> str:
     return os.path.splitext(src)[0] + ".epub"
+
+
+def guess_book_id(src: str) -> Optional[int]:
+    """UMD 文件名通常就是轻小说文库书号(例如 3943.umd -> 3943)。"""
+    stem = os.path.splitext(os.path.basename(src))[0]
+    if stem.isdigit():
+        return int(stem)
+    return None
+
+
+def default_illustration_cache(src: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(src)), ".umd2epub-illustrations")
 
 
 def convert_file(
@@ -63,8 +77,19 @@ def convert_file(
     lang: str = "zh",
     split_chars: int = DEFAULT_SPLIT_CHARS,
     cover: bool = True,
+    fetch_illustrations: bool = False,
+    book_id: Optional[int] = None,
+    illustration_cache: Optional[str] = None,
+    net_delay: float = 2.0,
+    illustration_fetcher: Optional[Callable] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> Report:
-    """把一个 .umd 转成 .epub; 失败时通过 Report 返回错误与退出码。"""
+    """把一个 .umd 转成 .epub; 失败时通过 Report 返回错误与退出码。
+
+    fetch_illustrations=True 时会联网到轻小说文库抓取插图(UMD 本身不含图片数据);
+    抓取失败只记 warning, 不影响本地转换。
+    """
+    say = log or (lambda message: None)
     report = Report(src=src, dry_run=dry_run)
 
     if not os.path.isfile(src):
@@ -104,6 +129,31 @@ def convert_file(
     report.has_cover = book.cover is not None
     report.cover_ext = book.cover_ext
     report.cover_size = len(book.cover) if book.cover else 0
+
+    resolved_id: Optional[int] = None
+    if fetch_illustrations:
+        resolved_id = book_id if book_id is not None else guess_book_id(src)
+        if resolved_id is None:
+            report.warnings.append(
+                "无法从文件名推断轻小说文库书号, 已跳过插图抓取(可用 --book-id 指定)"
+            )
+        else:
+            report.meta["book_id"] = str(resolved_id)
+
+    if fetch_illustrations and not dry_run and resolved_id is not None:
+        cache_dir = illustration_cache or default_illustration_cache(src)
+        try:
+            fetcher = illustration_fetcher or wenku8.fetch_illustrations
+            pages = fetcher(
+                resolved_id, delay=net_delay, cache_dir=cache_dir, log=say,
+            )
+            report.illustrations = wenku8.attach_illustrations(
+                book.chapters, pages, log=say,
+            )
+        except wenku8.Wenku8Error as exc:
+            report.warnings.append("插图抓取失败, 已按无插图转换: %s" % exc)
+        except Exception as exc:  # 网络/解析异常都不该毁掉本地转换
+            report.warnings.append("插图抓取出现意外错误, 已按无插图转换: %s" % exc)
 
     if dry_run:
         report.ok = True

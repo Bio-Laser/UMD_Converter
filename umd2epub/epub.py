@@ -9,11 +9,13 @@ from __future__ import annotations
 import dataclasses
 import html
 import io
+import os
 import re
 import uuid
 import zipfile
+from collections import OrderedDict
 from html.parser import HTMLParser
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .umd import UmdBook
 
@@ -30,6 +32,8 @@ CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
 STYLE_CSS = """body { line-height: 1.6; margin: 0 0.6em; }
 h1 { font-size: 1.3em; margin: 1.4em 0 0.8em; text-align: center; }
 p { text-indent: 2em; margin: 0.5em 0; }
+div.illus { margin: 0.8em 0; text-align: center; page-break-inside: avoid; }
+div.illus img { max-width: 100%; height: auto; }
 """
 
 _XHTML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +56,7 @@ _MEDIA_TYPES = {
     "png": "image/png",
     "gif": "image/gif",
     "bmp": "image/bmp",
+    "webp": "image/webp",
 }
 
 _ALLOWED_TAGS = {
@@ -62,6 +67,33 @@ _VOID_TAGS = {"br"}
 _BLOCK_HINTS = ("<br", "<BR", "<p>", "<p ", "<P>", "<P ", "<div", "<DIV", "<span", "<SPAN")
 
 _XML_ILLEGAL = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+_ILLUSTRATION_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+<title>{title}</title>
+<link rel="stylesheet" type="text/css" href="../style.css"/>
+</head>
+<body>
+<div class="illus"><img src="{src}" alt="{alt}"/></div>
+</body>
+</html>
+"""
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def store_illustration(image, store: "OrderedDict[str, bytes]") -> str:
+    """把插图登记进 EPUB 文件表, 返回包内路径(同一张图只存一份)。"""
+    stem = os.path.splitext(getattr(image, "name", "") or "")[0]
+    stem = _SAFE_NAME_RE.sub("_", stem).strip("._") or "illustration"
+    ext = (getattr(image, "ext", "") or "jpg").lower().lstrip(".") or "jpg"
+    href = "Images/%s.%s" % (stem, ext)
+    if href not in store:
+        store[href] = image.data
+    return href
 
 
 def xml_safe(text: str) -> str:
@@ -192,65 +224,101 @@ def build_epub(book: UmdBook, options: Optional[EpubOptions] = None) -> bytes:
     cover_href = "cover.%s" % cover_ext
     cover_media_type = _MEDIA_TYPES.get(cover_ext, "image/jpeg")
 
-    # (章节序号, 片序号, 片总数, 章节名, 片正文)
-    parts: List[Tuple[int, int, int, str, str]] = []
-    for chapter_index, chapter in enumerate(book.chapters, 1):
-        name = xml_safe(chapter.title).strip() or "第%d章" % chapter_index
-        chunks = split_text(chapter.text, opts.split_chars)
-        for part_index, chunk in enumerate(chunks, 1):
-            parts.append((chapter_index, part_index, len(chunks), name, chunk))
-    if not parts:
-        parts.append((1, 1, 1, "正文", ""))
-
     manifest: List[str] = [
         '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
         '<item id="css" href="style.css" media-type="text/css"/>',
     ]
     spine: List[str] = []
     body_docs: List[Tuple[str, bytes]] = []
+    chapter_targets: List[str] = []
+    illustration_files: "OrderedDict[str, bytes]" = OrderedDict()
 
-    for chapter_index, part_index, part_total, name, chunk in parts:
-        file_name = "text/c%04d_p%02d.xhtml" % (chapter_index, part_index)
-        item_id = "c%04dp%02d" % (chapter_index, part_index)
-        if part_total > 1 and part_index > 1:
-            doc_title = "%s（续 %d/%d）" % (name, part_index, part_total)
-        else:
-            doc_title = name
-        heading = ""
-        if part_index == 1:
-            display = name if part_total == 1 else "%s（1/%d）" % (name, part_total)
-            heading = "<h1>%s</h1>\n" % _esc(display)
+    for chapter_index, chapter in enumerate(book.chapters, 1):
+        name = xml_safe(chapter.title).strip() or "第%d章" % chapter_index
+        chunks = split_text(chapter.text, opts.split_chars)
+        if not chapter.text.strip() and chapter.images:
+            chunks = []          # 只放插图的章节, 不再生成空白正文页
+        target = ""
+        for part_index, chunk in enumerate(chunks, 1):
+            file_name = "text/c%04d_p%02d.xhtml" % (chapter_index, part_index)
+            item_id = "c%04dp%02d" % (chapter_index, part_index)
+            if len(chunks) > 1 and part_index > 1:
+                doc_title = "%s（续 %d/%d）" % (name, part_index, len(chunks))
+            else:
+                doc_title = name
+            heading = ""
+            if part_index == 1:
+                display = name if len(chunks) == 1 else "%s（1/%d）" % (name, len(chunks))
+                heading = "<h1>%s</h1>\n" % _esc(display)
+            doc = _XHTML_TEMPLATE.format(
+                lang=_esc(language),
+                title=_esc(doc_title),
+                heading=heading,
+                body=render_body(chunk),
+            )
+            body_docs.append(("OEBPS/" + file_name, doc.encode("utf-8")))
+            manifest.append(
+                '<item id="%s" href="%s" media-type="application/xhtml+xml"/>' % (item_id, file_name)
+            )
+            spine.append('<itemref idref="%s"/>' % item_id)
+            target = target or file_name
+
+        for image_index, image in enumerate(chapter.images, 1):
+            href = store_illustration(image, illustration_files)
+            file_name = "text/c%04d_i%02d.xhtml" % (chapter_index, image_index)
+            item_id = "c%04di%02d" % (chapter_index, image_index)
+            doc = _ILLUSTRATION_TEMPLATE.format(
+                lang=_esc(language),
+                title=_esc("%s 插图 %d" % (name, image_index)),
+                src=_esc("../" + href),
+                alt=_esc("插图 %d" % image_index),
+            )
+            body_docs.append(("OEBPS/" + file_name, doc.encode("utf-8")))
+            manifest.append(
+                '<item id="%s" href="%s" media-type="application/xhtml+xml"/>' % (item_id, file_name)
+            )
+            spine.append('<itemref idref="%s"/>' % item_id)
+            target = target or file_name
+        chapter_targets.append(target)
+
+    if not body_docs:
+        file_name = "text/c0001_p01.xhtml"
         doc = _XHTML_TEMPLATE.format(
-            lang=_esc(language),
-            title=_esc(doc_title),
-            heading=heading,
-            body=render_body(chunk),
+            lang=_esc(language), title=_esc("正文"), heading="", body="<p></p>",
         )
         body_docs.append(("OEBPS/" + file_name, doc.encode("utf-8")))
         manifest.append(
-            '<item id="%s" href="%s" media-type="application/xhtml+xml"/>' % (item_id, file_name)
+            '<item id="c0001p01" href="%s" media-type="application/xhtml+xml"/>' % file_name
         )
-        spine.append('<itemref idref="%s"/>' % item_id)
+        spine.append('<itemref idref="c0001p01"/>')
+        chapter_targets.append(file_name)
+
+    for number, href in enumerate(illustration_files, 1):
+        ext = href.rsplit(".", 1)[-1].lower()
+        manifest.append(
+            '<item id="img%04d" href="%s" media-type="%s"/>'
+            % (number, href, _MEDIA_TYPES.get(ext, "image/jpeg"))
+        )
 
     if cover is not None:
         manifest.append(
             '<item id="coverimg" href="%s" media-type="%s"/>' % (cover_href, cover_media_type)
         )
 
+    fallback_target = next((item for item in chapter_targets if item), "text/c0001_p01.xhtml")
     nav_points: List[str] = []
     for chapter_index, chapter in enumerate(book.chapters, 1):
         name = xml_safe(chapter.title).strip() or "第%d章" % chapter_index
+        target = chapter_targets[chapter_index - 1] or fallback_target
         nav_points.append(
             '<navPoint id="n%d" playOrder="%d"><navLabel><text>%s</text></navLabel>'
-            '<content src="text/c%04d_p01.xhtml"/></navPoint>' % (chapter_index, chapter_index, _esc(name), chapter_index)
+            '<content src="%s"/></navPoint>' % (chapter_index, chapter_index, _esc(name), target)
         )
 
     guide: List[str] = []
     if cover is not None:
         guide.append('<reference type="cover" title="封面" href="%s"/>' % cover_href)
-    guide.append(
-        '<reference type="text" title="正文" href="text/c%04d_p01.xhtml"/>' % parts[0][0]
-    )
+    guide.append('<reference type="text" title="正文" href="%s"/>' % fallback_target)
 
     opf_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -303,6 +371,8 @@ def build_epub(book: UmdBook, options: Optional[EpubOptions] = None) -> bytes:
         archive.writestr("OEBPS/style.css", STYLE_CSS)
         if cover is not None:
             archive.writestr("OEBPS/" + cover_href, cover)
+        for href, data in illustration_files.items():
+            archive.writestr("OEBPS/" + href, data)
         for name, payload in body_docs:
             archive.writestr(name, payload)
         archive.writestr("OEBPS/content.opf", "\n".join(opf_lines) + "\n")

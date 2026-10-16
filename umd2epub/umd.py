@@ -76,9 +76,20 @@ class UnsupportedUmdError(UmdError):
 
 
 @dataclasses.dataclass
+class Illustration:
+    """一张插图(通常来自联网抓取, 因为 UMD 里不含图片数据)。"""
+
+    name: str
+    ext: str
+    data: bytes
+    source_url: str = ""
+
+
+@dataclasses.dataclass
 class Chapter:
     title: str
     text: str
+    images: List["Illustration"] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -313,7 +324,8 @@ def _build_chapters(
     reasons: List[str] = []
     usable = bool(offsets) and bool(titles) and len(offsets) == len(titles)
     if usable:
-        if all(0 <= value < content_end for value in offsets):
+        # 允许末尾章节的起点正好等于正文末尾(末尾是空章的情况)
+        if all(0 <= value <= content_end for value in offsets):
             chapters = []
             for index, title in enumerate(titles):
                 start = offsets[index]
