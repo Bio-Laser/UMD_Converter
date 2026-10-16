@@ -34,6 +34,8 @@ h1 { font-size: 1.3em; margin: 1.4em 0 0.8em; text-align: center; }
 p { text-indent: 2em; margin: 0.5em 0; }
 div.illus { margin: 0.8em 0; text-align: center; page-break-inside: avoid; }
 div.illus img { max-width: 100%; height: auto; }
+div.cover { margin: 0; text-align: center; }
+div.cover img { max-width: 100%; height: auto; }
 """
 
 _XHTML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -83,6 +85,20 @@ _ILLUSTRATION_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+_COVER_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+<title>{title}</title>
+<link rel="stylesheet" type="text/css" href="../style.css"/>
+</head>
+<body>
+<div class="cover"><img src="{src}" alt="{alt}"/></div>
+</body>
+</html>
+"""
 
 
 def store_illustration(image, store: "OrderedDict[str, bytes]") -> str:
@@ -233,6 +249,20 @@ def build_epub(book: UmdBook, options: Optional[EpubOptions] = None) -> bytes:
     chapter_targets: List[str] = []
     illustration_files: "OrderedDict[str, bytes]" = OrderedDict()
 
+    # 封面页放在 spine 最前面: 部分阅读器只认封面页, 不认 opf 里的 meta
+    if cover is not None:
+        cover_doc = _COVER_TEMPLATE.format(
+            lang=_esc(language),
+            title=_esc(title),
+            src=_esc("../" + cover_href),
+            alt=_esc("封面"),
+        )
+        body_docs.append(("OEBPS/text/cover.xhtml", cover_doc.encode("utf-8")))
+        manifest.append(
+            '<item id="coverpage" href="text/cover.xhtml" media-type="application/xhtml+xml"/>'
+        )
+        spine.append('<itemref idref="coverpage"/>')
+
     for chapter_index, chapter in enumerate(book.chapters, 1):
         name = xml_safe(chapter.title).strip() or "第%d章" % chapter_index
         chunks = split_text(chapter.text, opts.split_chars)
@@ -317,7 +347,7 @@ def build_epub(book: UmdBook, options: Optional[EpubOptions] = None) -> bytes:
 
     guide: List[str] = []
     if cover is not None:
-        guide.append('<reference type="cover" title="封面" href="%s"/>' % cover_href)
+        guide.append('<reference type="cover" title="封面" href="text/cover.xhtml"/>')
     guide.append('<reference type="text" title="正文" href="%s"/>' % fallback_target)
 
     opf_lines = [

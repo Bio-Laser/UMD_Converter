@@ -42,6 +42,7 @@ class Report:
     dry_run: bool = False
     written: bool = False
     illustrations: int = 0
+    fetched_cover: bool = False
     has_cover: bool = False
     cover_ext: Optional[str] = None
     cover_size: int = 0
@@ -78,10 +79,12 @@ def convert_file(
     split_chars: int = DEFAULT_SPLIT_CHARS,
     cover: bool = True,
     fetch_illustrations: bool = False,
+    fetch_cover: bool = False,
     book_id: Optional[int] = None,
     illustration_cache: Optional[str] = None,
     net_delay: float = 2.0,
     illustration_fetcher: Optional[Callable] = None,
+    cover_fetcher: Optional[Callable] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> Report:
     """把一个 .umd 转成 .epub; 失败时通过 Report 返回错误与退出码。
@@ -131,29 +134,48 @@ def convert_file(
     report.cover_size = len(book.cover) if book.cover else 0
 
     resolved_id: Optional[int] = None
-    if fetch_illustrations:
+    if fetch_illustrations or fetch_cover:
         resolved_id = book_id if book_id is not None else guess_book_id(src)
         if resolved_id is None:
             report.warnings.append(
-                "无法从文件名推断轻小说文库书号, 已跳过插图抓取(可用 --book-id 指定)"
+                "无法从文件名推断轻小说文库书号, 已跳过联网抓取(可用 --book-id 指定)"
             )
         else:
             report.meta["book_id"] = str(resolved_id)
 
-    if fetch_illustrations and not dry_run and resolved_id is not None:
+    if (fetch_illustrations or fetch_cover) and not dry_run and resolved_id is not None:
         cache_dir = illustration_cache or default_illustration_cache(src)
-        try:
-            fetcher = illustration_fetcher or wenku8.fetch_illustrations
-            pages = fetcher(
-                resolved_id, delay=net_delay, cache_dir=cache_dir, log=say,
-            )
-            report.illustrations = wenku8.attach_illustrations(
-                book.chapters, pages, log=say,
-            )
-        except wenku8.Wenku8Error as exc:
-            report.warnings.append("插图抓取失败, 已按无插图转换: %s" % exc)
-        except Exception as exc:  # 网络/解析异常都不该毁掉本地转换
-            report.warnings.append("插图抓取出现意外错误, 已按无插图转换: %s" % exc)
+        # 封面: UMD 自带封面时以 UMD 为准, 只有没封面才去站点取
+        if fetch_cover and cover and book.cover is None:
+            try:
+                cover_hook = cover_fetcher or wenku8.fetch_cover
+                fetched = cover_hook(
+                    resolved_id, delay=net_delay, cache_dir=cache_dir, log=say,
+                )
+                if fetched is not None:
+                    book.cover = fetched.data
+                    book.cover_ext = fetched.ext
+                    report.fetched_cover = True
+                    report.has_cover = True
+                    report.cover_ext = fetched.ext
+                    report.cover_size = len(fetched.data)
+            except wenku8.Wenku8Error as exc:
+                report.warnings.append("封面抓取失败, 已按无封面转换: %s" % exc)
+            except Exception as exc:
+                report.warnings.append("封面抓取出现意外错误, 已按无封面转换: %s" % exc)
+        if fetch_illustrations:
+            try:
+                fetcher = illustration_fetcher or wenku8.fetch_illustrations
+                pages = fetcher(
+                    resolved_id, delay=net_delay, cache_dir=cache_dir, log=say,
+                )
+                report.illustrations = wenku8.attach_illustrations(
+                    book.chapters, pages, log=say,
+                )
+            except wenku8.Wenku8Error as exc:
+                report.warnings.append("插图抓取失败, 已按无插图转换: %s" % exc)
+            except Exception as exc:  # 网络/解析异常都不该毁掉本地转换
+                report.warnings.append("插图抓取出现意外错误, 已按无插图转换: %s" % exc)
 
     if dry_run:
         report.ok = True

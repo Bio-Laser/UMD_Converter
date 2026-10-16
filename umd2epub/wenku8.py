@@ -90,6 +90,11 @@ def book_page_url(book_id: int) -> str:
     return "%s/book/%d.htm" % (ROOT, book_id)
 
 
+def cover_url(book_id: int) -> str:
+    """站点上的封面图(实测约 20KB, 走 nginx, 比插图页快很多)。"""
+    return "http://img.wenku8.com/image/%d/%d/%ds.jpg" % (book_id // 1000, book_id, book_id)
+
+
 def chinese_numeral(text: str) -> Optional[int]:
     """把 "六" / "十二" / "13" 这类卷号转成整数。"""
     text = (text or "").strip()
@@ -308,6 +313,38 @@ def fetch_illustrations(
                 name=base_name, ext=ext, data=data, source_url=url,
             ))
     return pages
+
+
+def fetch_cover(
+    book_id: int,
+    *,
+    delay: float = 2.0,
+    timeout: float = 60.0,
+    retries: int = 3,
+    cache_dir: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Optional[FetchedIllustration]:
+    """抓取站点上该书的封面图; 失败抛 Wenku8Error。"""
+    fetcher = Fetcher(delay=delay, timeout=timeout, retries=retries, log=log)
+    url = cover_url(book_id)
+    base_name = "%ds.jpg" % book_id
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    cached = _cache_path(cache_dir, base_name)
+    data: Optional[bytes] = None
+    if cached and os.path.isfile(cached):
+        with open(cached, "rb") as handle:
+            data = handle.read()
+        log("  使用缓存封面: %s (%d 字节)" % (base_name, len(data)))
+    if data is None:
+        log("读取封面: %s" % url)
+        data = fetcher.get(url, referer=book_page_url(book_id))
+        if cached:
+            with open(cached, "wb") as handle:
+                handle.write(data)
+        log("  下载封面: %s (%d 字节)" % (base_name, len(data)))
+    ext = sniff_ext(data) or "jpg"
+    return FetchedIllustration(name=base_name, ext=ext, data=data, source_url=url)
 
 
 def attach_illustrations(

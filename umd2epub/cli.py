@@ -72,7 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fetch-illustrations",
         action="store_true",
-        help="联网到轻小说文库抓取插图(UMD 里不含图片数据, 默认不联网)",
+        help="联网到轻小说文库抓取插图(UMD 里不含图片数据, 默认不联网; 也会顺带抓封面)",
+    )
+    parser.add_argument(
+        "--fetch-cover",
+        action="store_true",
+        help="只联网抓取封面(UMD 自身没有封面时才有用), 不抓插图",
     )
     parser.add_argument(
         "--book-id",
@@ -146,6 +151,8 @@ def _print_success(report: Report, verbose: bool) -> None:
         head += "  作者: %s" % author
     print(head)
     print("写出: %s (%d 章, %s)" % (report.dst, report.chapters, _human_size(report.size)))
+    if report.fetched_cover:
+        print("封面: 已从轻小说文库抓取")
     if report.illustrations:
         print("插图: %d 张(已写入 EPUB)" % report.illustrations)
     if report.degraded:
@@ -181,6 +188,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             split_chars=args.split_chars,
             cover=not args.no_cover,
             fetch_illustrations=args.fetch_illustrations,
+            fetch_cover=args.fetch_cover or args.fetch_illustrations,
             book_id=args.book_id,
             illustration_cache=args.illustrations_cache,
             net_delay=args.net_delay,
