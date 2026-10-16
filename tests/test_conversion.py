@@ -134,7 +134,9 @@ def epub_archive(payload: bytes) -> zipfile.ZipFile:
 
 
 def chapter_files(archive: zipfile.ZipFile):
-    return [name for name in archive.namelist() if name.startswith("OEBPS/text/")]
+    """正文/插图页, 不含封面页。"""
+    return [name for name in archive.namelist()
+            if name.startswith("OEBPS/text/") and not name.endswith("cover.xhtml")]
 
 
 class ParseTests(unittest.TestCase):
@@ -214,7 +216,16 @@ class EpubTests(unittest.TestCase):
 
         files = chapter_files(archive)
         self.assertEqual(len(files), 2)
-        self.assertEqual(len(opf.findall("opf:spine/opf:itemref", OPF_NS)), 2)
+        # spine = 封面页 + 2 个正文章节页
+        spine = opf.findall("opf:spine/opf:itemref", OPF_NS)
+        self.assertEqual(len(spine), 3)
+        self.assertEqual(spine[0].get("idref"), "coverpage")
+        cover_page = "OEBPS/text/cover.xhtml"
+        self.assertIn(cover_page, names)
+        self.assertIn(b"../cover.jpg", archive.read(cover_page))
+        ET.fromstring(archive.read(cover_page))
+        self.assertIn('type="cover" title="封面" href="text/cover.xhtml"',
+                      archive.read("OEBPS/content.opf").decode("utf-8"))
         navpoints = ET.fromstring(archive.read("OEBPS/toc.ncx")).findall(
             NCX_NS + "navMap/" + NCX_NS + "navPoint"
         )
@@ -394,6 +405,7 @@ class Wenku8ParsingTests(unittest.TestCase):
     def test_book_urls(self):
         self.assertEqual(wenku8.book_index_url(3943), "https://www.wenku8.net/novel/3/3943/index.htm")
         self.assertEqual(wenku8.book_page_url(3943), "https://www.wenku8.net/book/3943.htm")
+        self.assertEqual(wenku8.cover_url(3943), "http://img.wenku8.com/image/3/3943/3943s.jpg")
 
 
 class IllustrationAttachTests(unittest.TestCase):
@@ -519,6 +531,44 @@ class FetchHookTests(unittest.TestCase):
                                    illustration_fetcher=fake_fetcher)
             self.assertTrue(report.ok, report.error)
             self.assertEqual(report.meta.get("book_id"), "777")
+
+    def test_fetch_cover_adds_site_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._source(tmp)
+
+            def fake_cover(book_id, **kwargs):
+                self.assertEqual(book_id, 3943)
+                return wenku8.FetchedIllustration("3943s.jpg", "jpg", JPEG, "u")
+
+            report = convert_file(src, fetch_cover=True, cover_fetcher=fake_cover)
+            self.assertTrue(report.ok, report.error)
+            self.assertTrue(report.fetched_cover)
+            with open(os.path.join(tmp, "3943.epub"), "rb") as handle:
+                archive = epub_archive(handle.read())
+            self.assertIn("OEBPS/cover.jpg", archive.namelist())
+            self.assertIn("OEBPS/text/cover.xhtml", archive.namelist())
+            opf = archive.read("OEBPS/content.opf").decode("utf-8")
+            self.assertIn('<meta name="cover" content="coverimg"/>', opf)
+
+    def test_umd_cover_wins_over_site_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "3943.umd")
+            with open(src, "wb") as handle:
+                handle.write(build_umd(cover=JPEG, chapters=(("第一章", "正文"),)))
+
+            called = []
+
+            def fake_cover(book_id, **kwargs):
+                called.append(book_id)
+                return wenku8.FetchedIllustration("3943s.jpg", "jpg", PNG, "u")
+
+            report = convert_file(src, fetch_cover=True, cover_fetcher=fake_cover)
+            self.assertTrue(report.ok, report.error)
+            self.assertFalse(report.fetched_cover)
+            self.assertEqual(called, [])
+            with open(os.path.join(tmp, "3943.epub"), "rb") as handle:
+                archive = epub_archive(handle.read())
+            self.assertEqual(archive.read("OEBPS/cover.jpg"), JPEG)
 
 
 if __name__ == "__main__":
