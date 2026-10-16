@@ -19,12 +19,19 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from umd2epub import parse_umd  # noqa: E402
-from umd2epub import cli  # noqa: E402
-from umd2epub.convert import EXIT_EXISTS, EXIT_FORMAT, EXIT_OK, EXIT_UNSUPPORTED  # noqa: E402
+from umd2epub import cli, wenku8  # noqa: E402
+from umd2epub.convert import (  # noqa: E402
+    EXIT_EXISTS,
+    EXIT_FORMAT,
+    EXIT_OK,
+    EXIT_UNSUPPORTED,
+    convert_file,
+)
 from umd2epub.epub import EpubOptions, build_epub  # noqa: E402
-from umd2epub.umd import UmdFormatError, UnsupportedUmdError  # noqa: E402
+from umd2epub.umd import Chapter, Illustration, UmdFormatError, UnsupportedUmdError  # noqa: E402
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 28 + b"\xff\xd9"
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 NCX_NS = "{http://www.daisy.org/z3986/2005/ncx/}"
 OPF_NS = {"opf": "http://www.idpf.org/2007/opf", "dc": "http://purl.org/dc/elements/1.1/"}
@@ -339,6 +346,179 @@ class CliTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             self.assertEqual(proc.returncode, 0, argv)
+
+
+INDEX_HTML = """<html><head><title>测试书 - 轻小说文库</title></head><body>
+<table><tr><td colspan="4">第一卷</td></tr>
+<tr><td><a href="1001.htm">序章</a></td><td><a href="1002.htm">第一章 开端</a></td></tr>
+<tr><td><a href="1003.htm">插图</a></td></tr>
+<tr><td colspan="4">第二卷</td></tr>
+<tr><td><a href="2001.htm">第一章</a></td></tr>
+<tr><td><a href="2002.htm">插图</a></td></tr>
+</table></body></html>"""
+
+
+class Wenku8ParsingTests(unittest.TestCase):
+    def test_parse_index_finds_illustration_pages_with_volumes(self):
+        pages = wenku8.parse_index(INDEX_HTML, "https://example.com/novel/1/1234/index.htm")
+        self.assertEqual([page.volume for page in pages], [1, 2])
+        self.assertEqual(
+            [page.url for page in pages],
+            ["https://example.com/novel/1/1234/1003.htm",
+             "https://example.com/novel/1/1234/2002.htm"],
+        )
+        self.assertEqual(wenku8.parse_page_title(INDEX_HTML), "测试书")
+
+    def test_chinese_numeral_and_volume_ordinal(self):
+        self.assertEqual(wenku8.chinese_numeral("六"), 6)
+        self.assertEqual(wenku8.chinese_numeral("十二"), 12)
+        self.assertEqual(wenku8.chinese_numeral("13"), 13)
+        self.assertEqual(wenku8.volume_ordinal("第三卷 插图"), 3)
+        self.assertIsNone(wenku8.volume_ordinal("后记"))
+
+    def test_parse_image_urls_dedupes_and_resolves(self):
+        html = ('<img src="../pic/a.jpg">'
+                '<img src="https://cdn.example.com/b.png">'
+                '<img src="../pic/a.jpg">')
+        urls = wenku8.parse_image_urls(html, "https://example.com/novel/1/1234/1003.htm")
+        self.assertEqual(
+            urls,
+            ["https://example.com/novel/1/pic/a.jpg", "https://cdn.example.com/b.png"],
+        )
+
+    def test_sniff_ext(self):
+        self.assertEqual(wenku8.sniff_ext(JPEG), "jpg")
+        self.assertEqual(wenku8.sniff_ext(PNG), "png")
+        self.assertIsNone(wenku8.sniff_ext(b"not an image"))
+
+    def test_book_urls(self):
+        self.assertEqual(wenku8.book_index_url(3943), "https://www.wenku8.net/novel/3/3943/index.htm")
+        self.assertEqual(wenku8.book_page_url(3943), "https://www.wenku8.net/book/3943.htm")
+
+
+class IllustrationAttachTests(unittest.TestCase):
+    @staticmethod
+    def _pages():
+        return [
+            wenku8.IllustrationPage(volume=1, title="插图", url="u1",
+                                    images=[wenku8.FetchedIllustration("219903.jpg", "jpg", JPEG, "u1")]),
+            wenku8.IllustrationPage(volume=2, title="插图", url="u2",
+                                    images=[wenku8.FetchedIllustration("219904.jpg", "jpg", PNG, "u2")]),
+        ]
+
+    def test_attach_matches_by_volume(self):
+        chapters = [Chapter("第一卷 序章", "正文"), Chapter("第二卷 插图", ""),
+                    Chapter("第一卷 插图", "")]
+        attached = wenku8.attach_illustrations(chapters, self._pages(), log=lambda message: None)
+        self.assertEqual(attached, 2)
+        self.assertEqual(chapters[1].images[0].name, "219904.jpg")
+        self.assertEqual(chapters[2].images[0].name, "219903.jpg")
+
+    def test_attach_falls_back_to_order(self):
+        chapters = [Chapter("插图", ""), Chapter("插图二", "")]
+        attached = wenku8.attach_illustrations(chapters, self._pages(), log=lambda message: None)
+        self.assertEqual(attached, 2)
+        self.assertEqual(chapters[0].images[0].name, "219903.jpg")
+        self.assertEqual(chapters[1].images[0].name, "219904.jpg")
+
+    def test_attach_errors_without_target_chapter(self):
+        with self.assertRaises(wenku8.Wenku8Error):
+            wenku8.attach_illustrations([Chapter("第一章", "正文")], self._pages(),
+                                        log=lambda message: None)
+
+
+class IllustrationEpubTests(unittest.TestCase):
+    def test_illustration_chapter_becomes_image_pages(self):
+        book = parse_umd(build_umd(chapters=(("第一卷 序章", "正文内容"), ("第一卷 插图", "\u2029"))))
+        book.chapters[1].images = [Illustration("219903.jpg", "jpg", JPEG, "u")]
+        archive = epub_archive(build_epub(book, EpubOptions(split_chars=0)))
+        names = archive.namelist()
+
+        self.assertIn("OEBPS/Images/219903.jpg", names)
+        self.assertEqual(archive.read("OEBPS/Images/219903.jpg"), JPEG)
+        self.assertNotIn("OEBPS/text/c0002_p01.xhtml", names)
+        illustration = "OEBPS/text/c0002_i01.xhtml"
+        self.assertIn(illustration, names)
+        self.assertIn(b"Images/219903.jpg", archive.read(illustration))
+        ET.fromstring(archive.read(illustration))
+
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+        self.assertIn('media-type="image/jpeg"', opf)
+        self.assertIn("text/c0002_i01.xhtml", archive.read("OEBPS/toc.ncx").decode("utf-8"))
+
+        xhtml_files = [name for name in names if name.endswith(".xhtml")]
+        spine = ET.fromstring(archive.read("OEBPS/content.opf")).findall("opf:spine/opf:itemref", OPF_NS)
+        self.assertEqual(len(spine), len(xhtml_files))
+
+    def test_illustrations_after_normal_chapter(self):
+        book = parse_umd(build_umd(chapters=(("第一卷 序章", "正文内容"),)))
+        book.chapters[0].images = [Illustration("a.jpg", "jpg", JPEG, "u")]
+        archive = epub_archive(build_epub(book, EpubOptions(split_chars=0)))
+        names = archive.namelist()
+        self.assertIn("OEBPS/text/c0001_p01.xhtml", names)
+        self.assertIn("OEBPS/text/c0001_i01.xhtml", names)
+        spine = ET.fromstring(archive.read("OEBPS/content.opf")).findall("opf:spine/opf:itemref", OPF_NS)
+        self.assertEqual(len(spine), 2)
+
+
+class FetchHookTests(unittest.TestCase):
+    def _source(self, tmp):
+        src = os.path.join(tmp, "3943.umd")
+        with open(src, "wb") as handle:
+            handle.write(build_umd(chapters=(("第一卷 序章", "正文"), ("第一卷 插图", "\u2029"))))
+        return src
+
+    def test_convert_with_injected_fetcher_embeds_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._source(tmp)
+
+            def fake_fetcher(book_id, **kwargs):
+                self.assertEqual(book_id, 3943)
+                return [wenku8.IllustrationPage(
+                    volume=1, title="插图", url="u",
+                    images=[wenku8.FetchedIllustration("219903.jpg", "jpg", JPEG, "u")],
+                )]
+
+            report = convert_file(
+                src,
+                fetch_illustrations=True,
+                illustration_fetcher=fake_fetcher,
+                illustration_cache=os.path.join(tmp, "cache"),
+            )
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(report.illustrations, 1)
+            self.assertEqual(report.meta.get("book_id"), "3943")
+            with open(os.path.join(tmp, "3943.epub"), "rb") as handle:
+                archive = epub_archive(handle.read())
+            self.assertIn("OEBPS/Images/219903.jpg", archive.namelist())
+
+    def test_fetch_failure_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._source(tmp)
+
+            def failing_fetcher(book_id, **kwargs):
+                raise wenku8.Wenku8Error("模拟网络失败")
+
+            report = convert_file(src, fetch_illustrations=True, illustration_fetcher=failing_fetcher)
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(report.illustrations, 0)
+            self.assertTrue(any("插图抓取失败" in item for item in report.warnings))
+            self.assertTrue(os.path.exists(os.path.join(tmp, "3943.epub")))
+
+    def test_book_id_can_be_given_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "我的小说.umd")
+            with open(src, "wb") as handle:
+                handle.write(build_umd(chapters=(("第一卷 插图", "插图占位"),)))
+
+            def fake_fetcher(book_id, **kwargs):
+                self.assertEqual(book_id, 777)
+                return []
+
+            report = convert_file(src, fetch_illustrations=True, book_id=777,
+                                   illustration_fetcher=fake_fetcher)
+            self.assertTrue(report.ok, report.error)
+            self.assertEqual(report.meta.get("book_id"), "777")
 
 
 if __name__ == "__main__":
